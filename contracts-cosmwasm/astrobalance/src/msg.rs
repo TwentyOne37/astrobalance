@@ -5,13 +5,14 @@ use cosmwasm_std::Addr;
 pub struct InstantiateMsg {
     pub admin: String,
     pub ai_operator: String,
+    pub accepted_denom: String,
 }
 
 #[cw_serde]
 pub enum ExecuteMsg {
-    Deposit { amount: u128 },
+    Deposit {},
     Withdraw { amount: u128 },
-    Rebalance {/* Add rebalance parameters as needed */},
+    Rebalance {},
 }
 
 #[cw_serde]
@@ -32,4 +33,5 @@ pub struct GetBalanceResponse {
 pub struct Config {
     pub admin: Addr,
     pub ai_operator: Addr,
+    pub accepted_denom: String,
 }

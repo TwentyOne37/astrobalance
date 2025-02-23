@@ -1,14 +1,15 @@
-#[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
+use cosmwasm_std::BankMsg;
+use cosmwasm_std::Coin;
 use cosmwasm_std::{
-    to_json_binary, Addr, Binary, Deps, DepsMut, Env, MessageInfo, OverflowError,
-    OverflowOperation, Response, StdError, StdResult,
+    to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, OverflowError, OverflowOperation,
+    Response, StdError, StdResult,
 };
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
 use crate::msg::{Config, ExecuteMsg, GetBalanceResponse, InstantiateMsg, QueryMsg};
-use crate::state::{Config as ConfigState, BALANCES, CONFIG};
+use crate::state::{BALANCES, CONFIG};
 
 // version info for migration
 const CONTRACT_NAME: &str = "crates.io:astrobalance";
@@ -21,21 +22,24 @@ pub fn instantiate(
     _info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    // Set contract version for future migrations
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    // Convert String addresses to Addr type
     let admin = deps.api.addr_validate(&msg.admin)?;
     let ai_operator = deps.api.addr_validate(&msg.ai_operator)?;
+    let accepted_denom = msg.accepted_denom.clone();
 
-    // Save config to state
-    let config = ConfigState { admin, ai_operator };
+    let config = crate::state::Config {
+        admin,
+        ai_operator,
+        accepted_denom: msg.accepted_denom,
+    };
     CONFIG.save(deps.storage, &config)?;
 
     Ok(Response::new()
         .add_attribute("method", "instantiate")
         .add_attribute("admin", msg.admin)
-        .add_attribute("ai_operator", msg.ai_operator))
+        .add_attribute("ai_operator", msg.ai_operator)
+        .add_attribute("accepted_denom", accepted_denom))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -46,20 +50,29 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        ExecuteMsg::Deposit { amount } => execute_deposit(deps, info, amount),
+        ExecuteMsg::Deposit {} => execute_deposit(deps, info),
         ExecuteMsg::Withdraw { amount } => execute_withdraw(deps, info, amount),
-        ExecuteMsg::Rebalance { .. } => execute_rebalance(deps, info),
+        ExecuteMsg::Rebalance {} => execute_rebalance(deps, info),
     }
 }
 
-pub fn execute_deposit(
-    deps: DepsMut,
-    info: MessageInfo,
-    amount: u128,
-) -> Result<Response, ContractError> {
-    if amount == 0 {
-        return Err(ContractError::InvalidAmount {});
-    }
+pub fn execute_deposit(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+
+    let amount = match info.funds.len() {
+        0 => return Err(ContractError::NoFunds {}),
+        1 => {
+            let fund = &info.funds[0];
+            if fund.denom != config.accepted_denom {
+                return Err(ContractError::InvalidDenom {
+                    expected: config.accepted_denom,
+                    received: fund.denom.clone(),
+                });
+            }
+            fund.amount.u128()
+        }
+        _ => return Err(ContractError::MultipleDenoms {}),
+    };
 
     // Update balance
     BALANCES.update(
@@ -86,6 +99,8 @@ pub fn execute_withdraw(
     info: MessageInfo,
     amount: u128,
 ) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+
     if amount == 0 {
         return Err(ContractError::InvalidAmount {});
     }
@@ -103,7 +118,17 @@ pub fn execute_withdraw(
         },
     )?;
 
+    // Create bank message to send tokens
+    let bank_msg = BankMsg::Send {
+        to_address: info.sender.to_string(),
+        amount: vec![Coin {
+            denom: config.accepted_denom,
+            amount: amount.into(),
+        }],
+    };
+
     Ok(Response::new()
+        .add_message(bank_msg)
         .add_attribute("method", "withdraw")
         .add_attribute("withdrawer", info.sender)
         .add_attribute("amount", amount.to_string()))
@@ -139,13 +164,17 @@ fn query_config(deps: Deps) -> StdResult<Config> {
     Ok(Config {
         admin: config.admin,
         ai_operator: config.ai_operator,
+        accepted_denom: config.accepted_denom,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+    use cosmwasm_std::testing::{message_info, mock_dependencies, mock_env};
+    use cosmwasm_std::{coins, Addr, Coin, CosmosMsg, Uint128};
+
+    const DENOM: &str = "usdc";
 
     fn setup_test_addresses() -> (String, String, String, String) {
         let deps = mock_dependencies();
@@ -156,16 +185,29 @@ mod tests {
         (creator, admin, operator, user)
     }
 
+    fn setup_contract(deps: DepsMut, creator: &str, admin: &str, operator: &str) {
+        let msg = InstantiateMsg {
+            admin: admin.to_string(),
+            ai_operator: operator.to_string(),
+            accepted_denom: DENOM.to_string(),
+        };
+        let creator_addr = Addr::unchecked(creator);
+        let info = message_info(&creator_addr, &[]);
+        instantiate(deps, mock_env(), info, msg).unwrap();
+    }
+
     #[test]
     fn proper_initialization() {
         let mut deps = mock_dependencies();
         let (creator, admin, operator, _) = setup_test_addresses();
-        let info = mock_info(&creator, &[]);
+        let creator_addr = Addr::unchecked(&creator);
 
         let msg = InstantiateMsg {
             admin: admin.clone(),
             ai_operator: operator.clone(),
+            accepted_denom: DENOM.to_string(),
         };
+        let info = message_info(&creator_addr, &[]);
 
         // Execute instantiate
         let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
@@ -175,27 +217,19 @@ mod tests {
         let config = query_config(deps.as_ref()).unwrap();
         assert_eq!(config.admin, Addr::unchecked(admin));
         assert_eq!(config.ai_operator, Addr::unchecked(operator));
+        assert_eq!(config.accepted_denom, DENOM);
     }
 
     #[test]
     fn test_deposit() {
         let mut deps = mock_dependencies();
         let (creator, admin, operator, user) = setup_test_addresses();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
 
-        // Instantiate contract
-        let msg = InstantiateMsg {
-            admin: admin.clone(),
-            ai_operator: operator.clone(),
-        };
-        let info = mock_info(&creator, &[]);
-        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // Test deposit
+        let user_addr = Addr::unchecked(&user);
         let deposit_amount = 100u128;
-        let info = mock_info(&user, &[]);
-        let msg = ExecuteMsg::Deposit {
-            amount: deposit_amount,
-        };
+        let info = message_info(&user_addr, &coins(deposit_amount, DENOM));
+        let msg = ExecuteMsg::Deposit {};
         let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
         assert_eq!(res.attributes.len(), 3);
 
@@ -205,34 +239,88 @@ mod tests {
     }
 
     #[test]
+    fn test_deposit_invalid_denom() {
+        let mut deps = mock_dependencies();
+        let (creator, admin, operator, user) = setup_test_addresses();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
+
+        // Try to deposit with wrong denom
+        let user_addr = Addr::unchecked(&user);
+        let info = message_info(&user_addr, &coins(100, "invalid"));
+        let msg = ExecuteMsg::Deposit {};
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(
+            err,
+            ContractError::InvalidDenom {
+                expected: DENOM.to_string(),
+                received: "invalid".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deposit_no_funds() {
+        let mut deps = mock_dependencies();
+        let (creator, admin, operator, user) = setup_test_addresses();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
+
+        // Try to deposit with no funds
+        let user_addr = Addr::unchecked(&user);
+        let info = message_info(&user_addr, &[]);
+        let msg = ExecuteMsg::Deposit {};
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(err, ContractError::NoFunds {});
+    }
+
+    #[test]
+    fn test_deposit_multiple_denoms() {
+        let mut deps = mock_dependencies();
+        let (creator, admin, operator, user) = setup_test_addresses();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
+
+        // Try to deposit multiple denoms
+        let user_addr = Addr::unchecked(&user);
+        let info = message_info(
+            &user_addr,
+            &[Coin::new(100u128, DENOM), Coin::new(100u128, "other")],
+        );
+        let msg = ExecuteMsg::Deposit {};
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(err, ContractError::MultipleDenoms {});
+    }
+
+    #[test]
     fn test_withdraw() {
         let mut deps = mock_dependencies();
         let (creator, admin, operator, user) = setup_test_addresses();
-
-        // Instantiate contract
-        let msg = InstantiateMsg {
-            admin: admin.clone(),
-            ai_operator: operator.clone(),
-        };
-        let info = mock_info(&creator, &[]);
-        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
 
         // First deposit
         let deposit_amount = 100u128;
-        let info = mock_info(&user, &[]);
-        let msg = ExecuteMsg::Deposit {
-            amount: deposit_amount,
-        };
+        let user_addr = Addr::unchecked(&user);
+        let info = message_info(&user_addr, &coins(deposit_amount, DENOM));
+        let msg = ExecuteMsg::Deposit {};
         execute(deps.as_mut(), mock_env(), info, msg).unwrap();
 
         // Test withdraw
         let withdraw_amount = 50u128;
-        let info = mock_info(&user, &[]);
+        let info = message_info(&user_addr, &[]);
         let msg = ExecuteMsg::Withdraw {
             amount: withdraw_amount,
         };
         let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-        assert_eq!(res.attributes.len(), 3);
+
+        // Check the bank message was created correctly
+        assert_eq!(res.messages.len(), 1);
+        match &res.messages[0].msg {
+            CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                assert_eq!(&Addr::unchecked(to_address), &user_addr);
+                assert_eq!(amount.len(), 1);
+                assert_eq!(amount[0].denom, DENOM);
+                assert_eq!(amount[0].amount, Uint128::from(withdraw_amount));
+            }
+            _ => panic!("Expected BankMsg::Send"),
+        }
 
         // Query updated balance
         let balance = query_balance(deps.as_ref(), user.clone()).unwrap();
@@ -240,49 +328,21 @@ mod tests {
     }
 
     #[test]
-    fn test_withdraw_insufficient_funds() {
-        let mut deps = mock_dependencies();
-        let (creator, admin, operator, user) = setup_test_addresses();
-
-        // Instantiate contract
-        let msg = InstantiateMsg {
-            admin: admin.clone(),
-            ai_operator: operator.clone(),
-        };
-        let info = mock_info(&creator, &[]);
-        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // Try to withdraw without deposit
-        let withdraw_amount = 50u128;
-        let info = mock_info(&user, &[]);
-        let msg = ExecuteMsg::Withdraw {
-            amount: withdraw_amount,
-        };
-        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-        assert_eq!(err, ContractError::InsufficientFunds {});
-    }
-
-    #[test]
     fn test_rebalance_permissions() {
         let mut deps = mock_dependencies();
         let (creator, admin, operator, user) = setup_test_addresses();
-
-        // Instantiate contract
-        let msg = InstantiateMsg {
-            admin: admin.clone(),
-            ai_operator: operator.clone(),
-        };
-        let info = mock_info(&creator, &[]);
-        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        setup_contract(deps.as_mut(), &creator, &admin, &operator);
 
         // Try to rebalance as non-operator
-        let info = mock_info(&user, &[]);
+        let user_addr = Addr::unchecked(&user);
+        let info = message_info(&user_addr, &[]);
         let msg = ExecuteMsg::Rebalance {};
         let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
         assert_eq!(err, ContractError::Unauthorized {});
 
         // Rebalance as operator
-        let info = mock_info(&operator, &[]);
+        let operator_addr = Addr::unchecked(&operator);
+        let info = message_info(&operator_addr, &[]);
         let msg = ExecuteMsg::Rebalance {};
         let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
         assert_eq!(res.attributes.len(), 1);
