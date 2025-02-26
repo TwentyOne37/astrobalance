@@ -54,3 +54,9 @@ pub enum ContractError {
     #[error("Emergency mode active")]
     EmergencyModeActive {},
 }
+
+impl From<ContractError> for StdError {
+    fn from(error: ContractError) -> Self {
+        StdError::generic_err(error.to_string())
+    }
+}

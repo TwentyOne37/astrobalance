@@ -1,3 +1,4 @@
+use crate::error::ContractError;
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
     to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, Deps, StdResult, Uint128, WasmMsg,
@@ -142,10 +143,100 @@ impl AstroportRouter {
 
         Ok((CosmosMsg::Wasm(swap_msg), simulate_swap.amount))
     }
+
+    // Get price quote for UI preview - doesn't execute a swap
+    pub fn get_price_quote(
+        &self,
+        deps: Deps,
+        from_denom: &str,
+        to_denom: &str,
+        amount: Uint128,
+    ) -> Result<Uint128, ContractError> {
+        // If same token, 1:1 rate
+        if from_denom == to_denom {
+            return Ok(amount);
+        }
+
+        // Determine swap direction
+        let (offer_denom, ask_denom, _is_to_usdc) = if to_denom == "usdc" {
+            (from_denom, "usdc", true)
+        } else if from_denom == "usdc" {
+            ("usdc", to_denom, false)
+        } else {
+            // For non-USDC pairs, we need to do a double hop through USDC
+            // First get quote from from_denom -> USDC
+            let usdc_amount = self.get_price_quote(deps, from_denom, "usdc", amount)?;
+            // Then get quote from USDC -> to_denom
+            return self.get_price_quote(deps, "usdc", to_denom, usdc_amount);
+        };
+
+        // Query Astroport for simulated swap
+        let simulate_result: StdResult<SimulateSwapResponse> = deps.querier.query_wasm_smart(
+            self.0.to_string(),
+            &astroport::QueryMsg::SimulateSwapOperations {
+                offer_amount: amount,
+                operations: vec![astroport::SwapOperation::AstroSwap {
+                    offer_asset_info: astroport::AssetInfo::NativeToken {
+                        denom: offer_denom.to_string(),
+                    },
+                    ask_asset_info: astroport::AssetInfo::NativeToken {
+                        denom: ask_denom.to_string(),
+                    },
+                }],
+            },
+        );
+
+        match simulate_result {
+            Ok(response) => Ok(response.amount),
+            Err(err) => Err(ContractError::ConversionError {
+                error: format!("Failed to get price quote: {}", err),
+            }),
+        }
+    }
+
+    // Safe version with error handling for contract usage
+    pub fn safe_convert_to_usdc(
+        &self,
+        deps: Deps,
+        denom: &str,
+        amount: Uint128,
+        max_slippage: Decimal,
+    ) -> Result<(CosmosMsg, Uint128), ContractError> {
+        if amount.is_zero() {
+            return Err(ContractError::InvalidAmount {});
+        }
+
+        match self.convert_to_usdc(deps, denom, amount, max_slippage) {
+            Ok(result) => Ok(result),
+            Err(err) => Err(ContractError::ConversionError {
+                error: format!("Failed to convert to USDC: {}", err),
+            }),
+        }
+    }
+
+    // Safe version with error handling for contract usage
+    pub fn safe_convert_from_usdc(
+        &self,
+        deps: Deps,
+        to_denom: &str,
+        amount: Uint128,
+        max_slippage: Decimal,
+    ) -> Result<(CosmosMsg, Uint128), ContractError> {
+        if amount.is_zero() {
+            return Err(ContractError::InvalidAmount {});
+        }
+
+        match self.convert_from_usdc(deps, to_denom, amount, max_slippage) {
+            Ok(result) => Ok(result),
+            Err(err) => Err(ContractError::ConversionError {
+                error: format!("Failed to convert from USDC: {}", err),
+            }),
+        }
+    }
 }
 
 // Astroport interface definitions - would be replaced with actual imports
-mod astroport {
+pub mod astroport {
     use cosmwasm_schema::cw_serde;
     use cosmwasm_std::Uint128;
 

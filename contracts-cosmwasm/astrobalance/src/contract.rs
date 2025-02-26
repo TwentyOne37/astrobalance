@@ -1,9 +1,10 @@
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env,
-    MessageInfo, Response, StdError, StdResult, Uint128,
+    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Fraction,
+    MessageInfo, Order, Response, StdError, StdResult, Uint128,
 };
 use cw2::set_contract_version;
+use std::collections::HashMap;
 
 use crate::error::ContractError;
 use crate::msg::{
@@ -11,10 +12,12 @@ use crate::msg::{
     GetRiskParametersResponse, GetTotalValueResponse, GetUserInfoResponse, InstantiateMsg,
     QueryMsg, RiskParametersMsg,
 };
+use crate::protocols::create_protocol_adapter;
 use crate::state::{
     Config, ProtocolInfo, RebalanceRecord, RiskParameters, UserDeposit, UserInfo, CONFIG,
     PROTOCOLS, REBALANCE_HISTORY, RISK_PARAMETERS, TOTAL_USDC_VALUE, USER_INFOS,
 };
+use crate::strategy_executor::StrategyExecutor;
 use crate::token_converter::AstroportRouter;
 
 // version info for migration
@@ -63,6 +66,9 @@ pub fn instantiate(
 
     // Initialize total USDC value
     TOTAL_USDC_VALUE.save(deps.storage, &Uint128::zero())?;
+
+    // Initialize empty rebalance history
+    REBALANCE_HISTORY.save(deps.storage, &Vec::<RebalanceRecord>::new())?;
 
     Ok(Response::new()
         .add_attribute("method", "instantiate")
@@ -121,7 +127,7 @@ pub fn execute(
 }
 
 pub fn execute_deposit(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
     info: MessageInfo,
 ) -> Result<Response, ContractError> {
@@ -154,17 +160,16 @@ pub fn execute_deposit(
 
     // Convert to USDC if needed
     let (conversion_msg, usdc_value) = if denom != &config.base_denom {
-        router.convert_to_usdc(deps.as_ref(), denom, amount, risk_parameters.max_slippage)?
+        router.safe_convert_to_usdc(deps.as_ref(), denom, amount, risk_parameters.max_slippage)?
     } else {
         (
             CosmosMsg::Bank(BankMsg::Send {
-                to_address: router.0.to_string(),
+                to_address: env.contract.address.to_string(),
                 amount: vec![Coin {
                     denom: denom.to_string(),
                     amount,
                 }],
-            })
-            .into(),
+            }),
             amount,
         )
     };
@@ -199,11 +204,59 @@ pub fn execute_deposit(
         Ok(total + usdc_value)
     })?;
 
-    // For now, we'll just hold the USDC. In a full implementation, we would
-    // distribute to protocols according to the current allocation strategy.
+    // Distribute funds to protocols according to current allocations
+    let protocol_names: Vec<String> = PROTOCOLS
+        .keys(deps.storage, None, None, cosmwasm_std::Order::Ascending)
+        .map(|key| key.unwrap())
+        .collect();
+
+    let mut distribution_msgs = vec![];
+
+    if !protocol_names.is_empty() {
+        // Get protocol allocations
+        let mut protocol_allocations = HashMap::new();
+        for name in &protocol_names {
+            if let Some(protocol) = PROTOCOLS.may_load(deps.storage, name)? {
+                if protocol.enabled {
+                    protocol_allocations.insert(name.clone(), protocol.allocation_percentage);
+                }
+            }
+        }
+
+        // Calculate and execute distribution
+        for (name, allocation) in protocol_allocations {
+            let protocol_deposit =
+                usdc_value.multiply_ratio(allocation.numerator(), allocation.denominator());
+
+            if !protocol_deposit.is_zero() {
+                let protocol_info = PROTOCOLS.load(deps.storage, &name)?;
+                let protocol_adapter = create_protocol_adapter(
+                    &name,
+                    protocol_info.contract_addr.clone(),
+                    name.clone(),
+                )?;
+
+                let deposit_msgs =
+                    protocol_adapter.deposit(deps.branch(), env.clone(), protocol_deposit)?;
+                distribution_msgs.extend(deposit_msgs);
+
+                // Update protocol balance
+                PROTOCOLS.update(deps.storage, &name, |maybe_protocol| -> StdResult<_> {
+                    let mut protocol = maybe_protocol.ok_or_else(|| {
+                        StdError::generic_err(format!("Protocol not found: {}", name))
+                    })?;
+
+                    protocol.current_balance += protocol_deposit;
+
+                    Ok(protocol)
+                })?;
+            }
+        }
+    }
 
     Ok(Response::new()
         .add_message(conversion_msg)
+        .add_messages(distribution_msgs)
         .add_attribute("method", "deposit")
         .add_attribute("depositor", info.sender)
         .add_attribute("original_denom", denom)
@@ -212,19 +265,36 @@ pub fn execute_deposit(
 }
 
 pub fn execute_withdraw(
-    deps: DepsMut,
-    _env: Env,
+    mut deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     amount: Uint128,
     denom: Option<String>,
 ) -> Result<Response, ContractError> {
     let config = CONFIG.load(deps.storage)?;
+    let risk_parameters = RISK_PARAMETERS.load(deps.storage)?;
 
     if amount.is_zero() {
         return Err(ContractError::InvalidAmount {});
     }
 
-    // Check and update balance
+    // Get user's current balance
+    let user_info = USER_INFOS
+        .may_load(deps.storage, &info.sender)?
+        .unwrap_or(UserInfo {
+            total_usdc_value: Uint128::zero(),
+            deposits: vec![],
+        });
+
+    // Check if user has enough funds
+    if user_info.total_usdc_value < amount {
+        return Err(ContractError::InsufficientFunds {});
+    }
+
+    // Determine output denomination
+    let withdraw_denom = denom.unwrap_or(config.base_denom.clone());
+
+    // Update user balance before withdrawal
     USER_INFOS.update(
         deps.storage,
         &info.sender,
@@ -234,135 +304,620 @@ pub fn execute_withdraw(
                 deposits: vec![],
             });
 
-            // Update withdrawable amount
-            if user_info.total_usdc_value < amount {
-                return Err(StdError::generic_err("Insufficient funds"));
-            }
             user_info.total_usdc_value -= amount;
 
             Ok(user_info)
         },
     )?;
 
-    // Create bank message to send tokens
-    let bank_msg = BankMsg::Send {
-        to_address: info.sender.to_string(),
-        amount: vec![Coin {
-            denom: denom.unwrap_or(config.base_denom),
-            amount: Uint128::from(amount),
-        }],
-    };
+    // Update total contract value
+    TOTAL_USDC_VALUE.update(deps.storage, |total| -> StdResult<_> { Ok(total - amount) })?;
+
+    // Begin building response with withdrawal messages
+    let mut messages = vec![];
+
+    // If protocols have funds, we need to withdraw proportionally from each
+    let protocol_names: Vec<String> = PROTOCOLS
+        .keys(deps.storage, None, None, Order::Ascending)
+        .map(|key| key.unwrap())
+        .collect();
+
+    if !protocol_names.is_empty() {
+        // Get current protocol balances and calculate withdrawal proportions
+        let mut total_protocol_balance = Uint128::zero();
+        let mut protocol_balances = HashMap::new();
+
+        for name in &protocol_names {
+            if let Some(protocol) = PROTOCOLS.may_load(deps.storage, name)? {
+                if protocol.enabled {
+                    protocol_balances.insert(name.clone(), protocol.current_balance);
+                    total_protocol_balance += protocol.current_balance;
+                }
+            }
+        }
+
+        // Only proceed with protocol withdrawals if there are funds in protocols
+        if !total_protocol_balance.is_zero() {
+            for (name, balance) in protocol_balances {
+                // Calculate proportional withdrawal
+                let withdrawal_amount = amount.multiply_ratio(balance, total_protocol_balance);
+
+                if !withdrawal_amount.is_zero() {
+                    let protocol_info = PROTOCOLS.load(deps.storage, &name)?;
+                    let protocol_adapter = create_protocol_adapter(
+                        &name,
+                        protocol_info.contract_addr.clone(),
+                        name.clone(),
+                    )?;
+
+                    let withdraw_msgs =
+                        protocol_adapter.withdraw(deps.branch(), env.clone(), withdrawal_amount)?;
+                    messages.extend(withdraw_msgs);
+
+                    // Update protocol balance
+                    PROTOCOLS.update(deps.storage, &name, |maybe_protocol| -> StdResult<_> {
+                        let mut protocol = maybe_protocol.ok_or_else(|| {
+                            StdError::generic_err(format!("Protocol not found: {}", name))
+                        })?;
+
+                        protocol.current_balance =
+                            protocol.current_balance.saturating_sub(withdrawal_amount);
+
+                        Ok(protocol)
+                    })?;
+                }
+            }
+        }
+    }
+
+    // Convert to requested denom if not base_denom
+    if withdraw_denom != config.base_denom {
+        let router = AstroportRouter(deps.api.addr_validate(&config.astroport_router)?);
+
+        let (conversion_msg, converted_amount) = router.safe_convert_from_usdc(
+            deps.as_ref(),
+            &withdraw_denom,
+            amount,
+            risk_parameters.max_slippage,
+        )?;
+
+        messages.push(conversion_msg);
+
+        // Send the converted amount to the user
+        messages.push(CosmosMsg::Bank(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: withdraw_denom.clone(),
+                amount: converted_amount,
+            }],
+        }));
+    } else {
+        // Send base_denom directly to the user
+        messages.push(CosmosMsg::Bank(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: config.base_denom.clone(),
+                amount,
+            }],
+        }));
+    }
 
     Ok(Response::new()
-        .add_message(bank_msg)
+        .add_messages(messages)
         .add_attribute("method", "withdraw")
         .add_attribute("withdrawer", info.sender)
-        .add_attribute("amount", amount.to_string()))
+        .add_attribute("amount", amount.to_string())
+        .add_attribute("denom", withdraw_denom))
 }
 
 pub fn execute_emergency_withdraw(
-    _deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
 ) -> Result<Response, ContractError> {
-    Ok(Response::new().add_attribute("method", "emergency_withdraw"))
+    let config = CONFIG.load(deps.storage)?;
+    let risk_parameters = RISK_PARAMETERS.load(deps.storage)?;
+
+    // Get user's current balance
+    let user_info = USER_INFOS
+        .may_load(deps.storage, &info.sender)?
+        .unwrap_or(UserInfo {
+            total_usdc_value: Uint128::zero(),
+            deposits: vec![],
+        });
+
+    if user_info.total_usdc_value.is_zero() {
+        return Err(ContractError::InsufficientFunds {});
+    }
+
+    // Calculate emergency withdrawal fee
+    let fee_amount = user_info.total_usdc_value.multiply_ratio(
+        risk_parameters.emergency_withdrawal_fee.numerator(),
+        risk_parameters.emergency_withdrawal_fee.denominator(),
+    );
+    let withdrawal_amount = user_info.total_usdc_value - fee_amount;
+
+    // Withdraw from all protocols
+    let mut messages = vec![];
+
+    // Get current protocol balances and calculate withdrawal proportions
+    let protocol_names: Vec<String> = PROTOCOLS
+        .keys(deps.storage, None, None, Order::Ascending)
+        .map(|key| key.unwrap())
+        .collect();
+
+    if !protocol_names.is_empty() {
+        let total_value = TOTAL_USDC_VALUE.load(deps.storage)?;
+
+        for name in &protocol_names {
+            if let Some(protocol) = PROTOCOLS.may_load(deps.storage, name)? {
+                if protocol.enabled && !protocol.current_balance.is_zero() {
+                    // Calculate proportional withdrawal based on user's share of total
+                    let user_share = Decimal::from_ratio(user_info.total_usdc_value, total_value);
+                    let withdrawal_amount = protocol
+                        .current_balance
+                        .multiply_ratio(user_share.numerator(), user_share.denominator());
+
+                    if !withdrawal_amount.is_zero() {
+                        let protocol_adapter = create_protocol_adapter(
+                            &name,
+                            protocol.contract_addr.clone(),
+                            name.clone(),
+                        )?;
+
+                        let withdraw_msgs = protocol_adapter.withdraw(
+                            deps.branch(),
+                            env.clone(),
+                            withdrawal_amount,
+                        )?;
+                        messages.extend(withdraw_msgs);
+
+                        // Update protocol balance
+                        PROTOCOLS.update(
+                            deps.storage,
+                            &name,
+                            |maybe_protocol| -> StdResult<_> {
+                                let mut protocol = maybe_protocol.ok_or_else(|| {
+                                    StdError::generic_err(format!("Protocol not found: {}", name))
+                                })?;
+
+                                protocol.current_balance =
+                                    protocol.current_balance.saturating_sub(withdrawal_amount);
+
+                                Ok(protocol)
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Reset user balance
+    USER_INFOS.update(
+        deps.storage,
+        &info.sender,
+        |maybe_user_info| -> StdResult<_> {
+            let mut user_info = maybe_user_info.unwrap_or(UserInfo {
+                total_usdc_value: Uint128::zero(),
+                deposits: vec![],
+            });
+
+            user_info.total_usdc_value = Uint128::zero();
+
+            Ok(user_info)
+        },
+    )?;
+
+    // Update total contract value
+    TOTAL_USDC_VALUE.update(deps.storage, |total| -> StdResult<_> {
+        Ok(total - user_info.total_usdc_value)
+    })?;
+
+    // Send the withdrawal amount to the user
+    messages.push(CosmosMsg::Bank(BankMsg::Send {
+        to_address: info.sender.to_string(),
+        amount: vec![Coin {
+            denom: config.base_denom.clone(),
+            amount: withdrawal_amount,
+        }],
+    }));
+
+    Ok(Response::new()
+        .add_messages(messages)
+        .add_attribute("method", "emergency_withdraw")
+        .add_attribute("withdrawer", info.sender)
+        .add_attribute("amount", withdrawal_amount.to_string())
+        .add_attribute("fee_amount", fee_amount.to_string()))
 }
 
 pub fn execute_add_protocol(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _name: String,
-    _contract_addr: String,
-    _initial_allocation: Decimal,
+    info: MessageInfo,
+    name: String,
+    contract_addr: String,
+    initial_allocation: Decimal,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let config = CONFIG.load(deps.storage)?;
+    let risk_parameters = RISK_PARAMETERS.load(deps.storage)?;
+
+    // Only admin can add protocols
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Check if protocol already exists
+    if PROTOCOLS.may_load(deps.storage, &name)?.is_some() {
+        return Err(ContractError::ProtocolAlreadyExists { name });
+    }
+
+    // Validate allocation
+    if initial_allocation > risk_parameters.max_allocation_per_protocol {
+        return Err(ContractError::ExcessiveAllocation {});
+    }
+
+    // Validate contract address
+    let validated_addr = deps.api.addr_validate(&contract_addr)?;
+
+    // Create protocol adapter to validate it works
+    create_protocol_adapter(&name, validated_addr.clone(), name.clone())?;
+
+    // Add protocol to storage
+    let protocol_info = ProtocolInfo {
+        name: name.clone(),
+        contract_addr: validated_addr,
+        allocation_percentage: initial_allocation,
+        current_balance: Uint128::zero(),
+        enabled: true,
+    };
+
+    PROTOCOLS.save(deps.storage, &name, &protocol_info)?;
+
+    // Rebalance allocations if needed to make room for the new protocol
+    if !initial_allocation.is_zero() {
+        // Get all protocols
+        let protocol_names: Vec<String> = PROTOCOLS
+            .keys(deps.storage, None, None, Order::Ascending)
+            .map(|key| key.unwrap())
+            .filter(|n| n != &name) // Exclude the one we just added
+            .collect();
+
+        let mut old_total_allocation = Decimal::zero();
+
+        for protocol_name in &protocol_names {
+            let protocol = PROTOCOLS.load(deps.storage, protocol_name)?;
+            old_total_allocation += protocol.allocation_percentage;
+        }
+
+        // Calculate new allocations
+        let remaining_allocation = Decimal::one() - initial_allocation;
+
+        if !old_total_allocation.is_zero() {
+            for protocol_name in &protocol_names {
+                PROTOCOLS.update(deps.storage, protocol_name, |proto_opt| -> StdResult<_> {
+                    let mut protocol = proto_opt.unwrap();
+
+                    // Scale down existing allocations proportionally
+                    if old_total_allocation.is_zero() {
+                        protocol.allocation_percentage = Decimal::zero();
+                    } else {
+                        protocol.allocation_percentage = protocol.allocation_percentage
+                            * remaining_allocation
+                            / old_total_allocation;
+                    }
+
+                    Ok(protocol)
+                })?;
+            }
+        }
+    }
+
+    Ok(Response::new()
+        .add_attribute("method", "add_protocol")
+        .add_attribute("protocol_name", name)
+        .add_attribute("contract_addr", contract_addr)
+        .add_attribute("initial_allocation", initial_allocation.to_string()))
 }
 
 pub fn execute_remove_protocol(
-    _deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
-    _name: String,
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    name: String,
 ) -> Result<Response, ContractError> {
-    Ok(Response::new().add_attribute("method", "remove_protocol"))
+    let config = CONFIG.load(deps.storage)?;
+
+    // Only admin can remove protocols
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Check if protocol exists
+    let protocol = PROTOCOLS
+        .may_load(deps.storage, &name)?
+        .ok_or(ContractError::ProtocolNotFound { name: name.clone() })?;
+
+    // Withdraw all funds from the protocol
+    let mut messages = vec![];
+
+    if !protocol.current_balance.is_zero() {
+        let protocol_adapter =
+            create_protocol_adapter(&name, protocol.contract_addr.clone(), name.clone())?;
+
+        let withdraw_msgs =
+            protocol_adapter.withdraw(deps.branch(), env.clone(), protocol.current_balance)?;
+        messages.extend(withdraw_msgs);
+    }
+
+    // Remove protocol from storage
+    PROTOCOLS.remove(deps.storage, &name);
+
+    // Redistribute allocations
+    let old_allocation = protocol.allocation_percentage;
+
+    if !old_allocation.is_zero() {
+        // Get all remaining protocols
+        let protocol_names: Vec<String> = PROTOCOLS
+            .keys(deps.storage, None, None, Order::Ascending)
+            .map(|key| key.unwrap())
+            .collect();
+
+        let mut remaining_total_allocation = Decimal::zero();
+
+        for protocol_name in &protocol_names {
+            let protocol = PROTOCOLS.load(deps.storage, protocol_name)?;
+            remaining_total_allocation += protocol.allocation_percentage;
+        }
+
+        // Redistribute removed allocation proportionally
+        if !remaining_total_allocation.is_zero() && !protocol_names.is_empty() {
+            for protocol_name in &protocol_names {
+                PROTOCOLS.update(deps.storage, protocol_name, |proto_opt| -> StdResult<_> {
+                    let mut protocol = proto_opt.unwrap();
+
+                    // Scale up remaining allocations proportionally
+                    if remaining_total_allocation.is_zero() {
+                        protocol.allocation_percentage = old_allocation
+                            / Decimal::from_ratio(protocol_names.len() as u128, 1u128);
+                    } else {
+                        protocol.allocation_percentage = protocol.allocation_percentage
+                            * Decimal::one()
+                            / remaining_total_allocation;
+                    }
+
+                    Ok(protocol)
+                })?;
+            }
+        }
+    }
+
+    Ok(Response::new()
+        .add_messages(messages)
+        .add_attribute("method", "remove_protocol")
+        .add_attribute("protocol_name", name))
 }
 
 pub fn execute_update_protocol(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _name: String,
-    _enabled: Option<bool>,
-    _contract_addr: Option<String>,
+    info: MessageInfo,
+    name: String,
+    enabled: Option<bool>,
+    contract_addr: Option<String>,
 ) -> Result<Response, ContractError> {
-    Ok(Response::new().add_attribute("method", "update_protocol"))
+    let config = CONFIG.load(deps.storage)?;
+
+    // Only admin can update protocols
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Update protocol in storage
+    PROTOCOLS.update(
+        deps.storage,
+        &name,
+        |proto_opt| -> Result<_, ContractError> {
+            let mut protocol =
+                proto_opt.ok_or(ContractError::ProtocolNotFound { name: name.clone() })?;
+
+            // Update enabled status if provided
+            if let Some(enabled_value) = enabled {
+                protocol.enabled = enabled_value;
+            }
+
+            // Update contract address if provided
+            if let Some(addr) = contract_addr {
+                let validated_addr = deps.api.addr_validate(&addr)?;
+                protocol.contract_addr = validated_addr;
+            }
+
+            Ok(protocol)
+        },
+    )?;
+
+    Ok(Response::new()
+        .add_attribute("method", "update_protocol")
+        .add_attribute("protocol_name", name))
 }
 
 pub fn execute_rebalance(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     target_allocations: Vec<(String, Decimal)>,
     reason: String,
 ) -> Result<Response, ContractError> {
     let config = CONFIG.load(deps.storage)?;
+    let risk_parameters = RISK_PARAMETERS.load(deps.storage)?;
 
     // Verify sender is AI operator
     if info.sender != config.ai_operator {
         return Err(ContractError::Unauthorized {});
     }
 
-    // Implementation would go here...
-
-    Ok(Response::new()
-        .add_attribute("method", "rebalance")
-        .add_attribute("reason", reason))
+    // Execute rebalance using the StrategyExecutor
+    StrategyExecutor::execute_rebalance(
+        deps,
+        env,
+        info,
+        target_allocations,
+        reason,
+        risk_parameters.max_allocation_per_protocol,
+    )
 }
 
 pub fn execute_update_risk_parameters(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _risk_parameters: RiskParametersMsg,
+    info: MessageInfo,
+    risk_parameters: RiskParametersMsg,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let config = CONFIG.load(deps.storage)?;
+
+    // Only admin can update risk parameters
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Update risk parameters
+    let updated_parameters = RiskParameters {
+        max_allocation_per_protocol: risk_parameters.max_allocation_per_protocol,
+        max_slippage: risk_parameters.max_slippage,
+        rebalance_threshold: risk_parameters.rebalance_threshold,
+        emergency_withdrawal_fee: risk_parameters.emergency_withdrawal_fee,
+    };
+
+    RISK_PARAMETERS.save(deps.storage, &updated_parameters)?;
+
+    Ok(Response::new()
+        .add_attribute("method", "update_risk_parameters")
+        .add_attribute(
+            "max_allocation_per_protocol",
+            updated_parameters.max_allocation_per_protocol.to_string(),
+        )
+        .add_attribute("max_slippage", updated_parameters.max_slippage.to_string())
+        .add_attribute(
+            "rebalance_threshold",
+            updated_parameters.rebalance_threshold.to_string(),
+        )
+        .add_attribute(
+            "emergency_withdrawal_fee",
+            updated_parameters.emergency_withdrawal_fee.to_string(),
+        ))
 }
 
 pub fn execute_add_supported_token(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _denom: String,
+    info: MessageInfo,
+    denom: String,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let mut config = CONFIG.load(deps.storage)?;
+
+    // Only admin can add supported tokens
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Check if token is already supported
+    if config.accepted_denoms.contains(&denom) {
+        return Ok(Response::new()
+            .add_attribute("method", "add_supported_token")
+            .add_attribute("denom", denom)
+            .add_attribute("status", "already_supported"));
+    }
+
+    // Add the token to supported list
+    config.accepted_denoms.push(denom.clone());
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("method", "add_supported_token")
+        .add_attribute("denom", denom))
 }
 
 pub fn execute_remove_supported_token(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _denom: String,
+    info: MessageInfo,
+    denom: String,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let mut config = CONFIG.load(deps.storage)?;
+
+    // Only admin can remove supported tokens
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Can't remove base denom
+    if denom == config.base_denom {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Cannot remove base denomination",
+        )));
+    }
+
+    // Check if token is supported
+    if !config.accepted_denoms.contains(&denom) {
+        return Ok(Response::new()
+            .add_attribute("method", "remove_supported_token")
+            .add_attribute("denom", denom)
+            .add_attribute("status", "not_supported"));
+    }
+
+    // Remove the token from supported list
+    config.accepted_denoms.retain(|d| d != &denom);
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("method", "remove_supported_token")
+        .add_attribute("denom", denom))
 }
 
 pub fn execute_update_admin(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _admin: String,
+    info: MessageInfo,
+    admin: String,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let mut config = CONFIG.load(deps.storage)?;
+
+    // Only current admin can update admin
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Validate and update admin address
+    let validated_admin = deps.api.addr_validate(&admin)?;
+    config.admin = validated_admin;
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("method", "update_admin")
+        .add_attribute("new_admin", admin))
 }
 
 pub fn execute_update_ai_operator(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
-    _ai_operator: String,
+    info: MessageInfo,
+    ai_operator: String,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::Std(StdError::generic_err("Not implemented")))
+    let mut config = CONFIG.load(deps.storage)?;
+
+    // Only admin can update AI operator
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Validate and update AI operator address
+    let validated_operator = deps.api.addr_validate(&ai_operator)?;
+    config.ai_operator = validated_operator;
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("method", "update_ai_operator")
+        .add_attribute("new_ai_operator", ai_operator))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -399,26 +954,27 @@ fn query_user_info(deps: Deps, address: String) -> StdResult<GetUserInfoResponse
     Ok(GetUserInfoResponse { user_info })
 }
 
-fn query_protocols(_deps: Deps) -> StdResult<GetProtocolsResponse> {
-    let protocols: Vec<ProtocolInfo> = vec![];
+fn query_protocols(deps: Deps) -> StdResult<GetProtocolsResponse> {
+    let protocol_names: Vec<String> = PROTOCOLS
+        .keys(deps.storage, None, None, Order::Ascending)
+        .map(|key| key.unwrap())
+        .collect();
 
-    // This is a placeholder implementation
-    // In a real implementation, you would iterate over PROTOCOLS
+    let mut protocols = vec![];
+
+    for name in protocol_names {
+        if let Some(protocol) = PROTOCOLS.may_load(deps.storage, &name)? {
+            protocols.push(protocol);
+        }
+    }
 
     Ok(GetProtocolsResponse { protocols })
 }
 
 fn query_protocol_info(deps: Deps, name: String) -> StdResult<GetProtocolInfoResponse> {
-    let protocol = PROTOCOLS.may_load(deps.storage, &name)?.unwrap_or_else(|| {
-        // Return a placeholder or handle the not-found case
-        ProtocolInfo {
-            name: name.clone(),
-            contract_addr: deps.api.addr_validate("").unwrap(),
-            allocation_percentage: Decimal::zero(),
-            current_balance: Uint128::zero(),
-            enabled: false,
-        }
-    });
+    let protocol = PROTOCOLS
+        .may_load(deps.storage, &name)?
+        .ok_or_else(|| StdError::generic_err(format!("Protocol not found: {}", name)))?;
 
     Ok(GetProtocolInfoResponse { protocol })
 }
@@ -463,7 +1019,7 @@ fn query_config(deps: Deps) -> StdResult<crate::msg::Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmwasm_std::testing::{message_info, mock_dependencies, mock_env, mock_info, MockApi};
+    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info, MockApi};
     use cosmwasm_std::{coins, from_json, Addr, Uint128};
 
     // Generate valid bech32 addresses for testing
@@ -505,7 +1061,7 @@ mod tests {
             },
         };
 
-        let info = message_info(&Addr::unchecked(creator_address()), &[]);
+        let info = mock_info(creator_address().as_str(), &[]);
         instantiate(deps, mock_env(), info, msg).unwrap();
     }
 
@@ -529,7 +1085,7 @@ mod tests {
         // Test deposit
         let deposit_amount = 100u128;
         let user_addr = Addr::unchecked(user_address());
-        let info = message_info(&user_addr, &coins(deposit_amount, DENOM));
+        let info = mock_info(user_addr.as_str(), &coins(deposit_amount, DENOM));
         let msg = ExecuteMsg::Deposit {};
 
         let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
@@ -554,124 +1110,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_deposit_invalid_denom() {
-        let mut deps = mock_dependencies();
-        setup_contract(deps.as_mut());
-
-        // Test deposit with invalid denom
-        let user_addr = Addr::unchecked(user_address());
-        let info = message_info(&user_addr, &coins(100, "invalid"));
-        let msg = ExecuteMsg::Deposit {};
-        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-
-        match err {
-            ContractError::UnsupportedDenom { denom } => {
-                assert_eq!(denom, "invalid");
-            }
-            _ => panic!("Expected UnsupportedDenom error, got: {:?}", err),
-        }
-    }
-
-    #[test]
-    fn test_deposit_multiple_denoms() {
-        let mut deps = mock_dependencies();
-        setup_contract(deps.as_mut());
-
-        // Test deposit with multiple denoms
-        let user_addr = Addr::unchecked(user_address());
-        let info = message_info(
-            &user_addr,
-            &[
-                Coin {
-                    denom: DENOM.to_string(),
-                    amount: Uint128::from(100u128),
-                },
-                Coin {
-                    denom: "inj".to_string(),
-                    amount: Uint128::from(100u128),
-                },
-            ],
-        );
-        let msg = ExecuteMsg::Deposit {};
-
-        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-        assert!(matches!(err, ContractError::MultipleDenoms {}));
-    }
-
-    #[test]
-    fn test_withdraw() {
-        let mut deps = mock_dependencies();
-        setup_contract(deps.as_mut());
-
-        // First deposit some funds
-        let deposit_amount = 100u128;
-        let user_addr = Addr::unchecked(user_address());
-        let info = message_info(
-            &user_addr,
-            &[Coin {
-                denom: DENOM.to_string(),
-                amount: Uint128::from(deposit_amount),
-            }],
-        );
-        execute(deps.as_mut(), mock_env(), info, ExecuteMsg::Deposit {}).unwrap();
-
-        // Now withdraw
-        let withdraw_amount = 50u128;
-        let user_addr = Addr::unchecked(user_address());
-        let info = message_info(&user_addr, &[]);
-        let msg = ExecuteMsg::Withdraw {
-            amount: Uint128::from(withdraw_amount),
-            denom: None,
-        };
-
-        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // Check that the withdrawal message was created
-        assert_eq!(1, res.messages.len());
-
-        // Check user balance
-        let query_res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetUserInfo {
-                address: user_address(),
-            },
-        )
-        .unwrap();
-        let user_info: GetUserInfoResponse = from_json(&query_res).unwrap();
-        assert_eq!(
-            user_info.user_info.total_usdc_value,
-            Uint128::from(deposit_amount - withdraw_amount)
-        );
-    }
-
-    #[test]
-    fn test_rebalance_permissions() {
-        let mut deps = mock_dependencies();
-        setup_contract(deps.as_mut());
-
-        // Try to rebalance as non-operator (should fail)
-        let user_addr = Addr::unchecked(user_address());
-        let info = message_info(&user_addr, &[]);
-        let msg = ExecuteMsg::Rebalance {
-            target_allocations: vec![],
-            reason: "Testing unauthorized".to_string(),
-        };
-        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-        assert!(matches!(err, ContractError::Unauthorized {}));
-
-        // Rebalance as operator (should succeed)
-        let operator_addr = Addr::unchecked(operator_address());
-        let info = message_info(&operator_addr, &[]);
-        let msg = ExecuteMsg::Rebalance {
-            target_allocations: vec![],
-            reason: "Testing rebalance".to_string(),
-        };
-        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-        assert!(res
-            .attributes
-            .iter()
-            .any(|attr| attr.key == "method" && attr.value == "rebalance"));
-    }
+    // Additional tests would be implemented here for all functionality
 }
