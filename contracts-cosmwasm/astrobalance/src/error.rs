@@ -21,6 +21,36 @@ pub enum ContractError {
     #[error("Invalid denomination. Expected {expected}, received {received}")]
     InvalidDenom { expected: String, received: String },
 
+    #[error("Unsupported denomination: {denom}")]
+    UnsupportedDenom { denom: String },
+
     #[error("Multiple denominations not supported")]
     MultipleDenoms {},
+
+    #[error("Allocation exceeds maximum allowed")]
+    ExcessiveAllocation {},
+
+    #[error("Protocol not found: {name}")]
+    ProtocolNotFound { name: String },
+
+    #[error("Protocol already exists: {name}")]
+    ProtocolAlreadyExists { name: String },
+
+    #[error("Allocations must sum to 100%")]
+    InvalidAllocations {},
+
+    #[error("Deposit in progress")]
+    DepositInProgress {},
+
+    #[error("Failed to convert token: {error}")]
+    ConversionError { error: String },
+
+    #[error("Protocol integration error: {error}")]
+    ProtocolError { error: String },
+
+    #[error("Excessive slippage detected")]
+    ExcessiveSlippage {},
+
+    #[error("Emergency mode active")]
+    EmergencyModeActive {},
 }
