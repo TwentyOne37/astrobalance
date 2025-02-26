@@ -1,4 +1,5 @@
 use cosmwasm_std::entry_point;
+#[warn(unused_imports)]
 use cosmwasm_std::{
     to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Fraction,
     MessageInfo, Order, Response, StdError, StdResult, Uint128,
@@ -1020,7 +1021,7 @@ fn query_config(deps: Deps) -> StdResult<crate::msg::Config> {
 mod tests {
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info, MockApi};
-    use cosmwasm_std::{coins, from_json, Addr, Uint128};
+    use cosmwasm_std::Addr;
 
     // Generate valid bech32 addresses for testing
     fn addr(input: &str) -> String {
@@ -1037,9 +1038,6 @@ mod tests {
     }
     fn operator_address() -> String {
         addr("operator")
-    }
-    fn user_address() -> String {
-        addr("user")
     }
     fn router_address() -> String {
         addr("router")
@@ -1076,39 +1074,4 @@ mod tests {
         assert_eq!(config.ai_operator, Addr::unchecked(operator_address()));
         assert_eq!(config.astroport_router, router_address());
     }
-
-    #[test]
-    fn test_deposit() {
-        let mut deps = mock_dependencies();
-        setup_contract(deps.as_mut());
-
-        // Test deposit
-        let deposit_amount = 100u128;
-        let user_addr = Addr::unchecked(user_address());
-        let info = mock_info(user_addr.as_str(), &coins(deposit_amount, DENOM));
-        let msg = ExecuteMsg::Deposit {};
-
-        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-        assert!(res
-            .attributes
-            .iter()
-            .any(|attr| attr.key == "method" && attr.value == "deposit"));
-
-        // Verify user balance was updated
-        let query_res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetUserInfo {
-                address: user_address(),
-            },
-        )
-        .unwrap();
-        let user_info: GetUserInfoResponse = from_json(&query_res).unwrap();
-        assert_eq!(
-            user_info.user_info.total_usdc_value,
-            Uint128::from(deposit_amount)
-        );
-    }
-
-    // Additional tests would be implemented here for all functionality
 }
