@@ -166,8 +166,8 @@ fn test_add_protocol_with_invalid_allocation() {
     setup_contract(deps.as_mut());
     let admin = Addr::unchecked(admin_address());
 
-    // Try to add with allocation over the max (50%)
-    let excessive_allocation = Decimal::percent(60);
+    // Try to add with allocation over the max (100%)
+    let excessive_allocation = Decimal::percent(101);
     let info = message_info(&admin, &[]);
     let msg = ExecuteMsg::AddProtocol {
         name: "test_protocol".to_string(),

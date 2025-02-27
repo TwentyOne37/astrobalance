@@ -48,7 +48,7 @@ pub mod test_models {
 }
 
 // Constants for testing
-pub const DENOM: &str = "usdc";
+pub const DENOM: &str = "peggy0x87aB3B4C8661e07D6372361211B96ed4Dc36B1B5";
 
 // Generate valid bech32 addresses for testing
 pub fn addr(input: &str) -> String {
@@ -80,11 +80,14 @@ pub fn setup_contract(deps: DepsMut) {
     let msg = InstantiateMsg {
         admin: admin_address(),
         ai_operator: operator_address(),
-        base_denom: DENOM.to_string(),
-        accepted_denoms: vec![DENOM.to_string(), "inj".to_string()],
+        base_denom: "peggy0x87aB3B4C8661e07D6372361211B96ed4Dc36B1B5".to_string(), // USDT
+        accepted_denoms: vec![
+            "peggy0x87aB3B4C8661e07D6372361211B96ed4Dc36B1B5".to_string(),
+            "inj".to_string(),
+        ],
         astroport_router: router_address(),
         risk_parameters: RiskParametersMsg {
-            max_allocation_per_protocol: Decimal::percent(50),
+            max_allocation_per_protocol: Decimal::percent(100), // Allow up to 100% allocation
             max_slippage: Decimal::percent(1),
             rebalance_threshold: Decimal::percent(5),
             emergency_withdrawal_fee: Decimal::percent(1),

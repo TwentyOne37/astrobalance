@@ -3,8 +3,11 @@ use cosmwasm_std::testing::{
 };
 use cosmwasm_std::{coins, from_json, Addr, Decimal, Empty, OwnedDeps};
 
-use crate::contract::{execute, query};
-use crate::msg::{ExecuteMsg, GetProtocolsResponse, GetRebalanceHistoryResponse, QueryMsg};
+use crate::contract::{execute, instantiate, query};
+use crate::msg::{
+    ExecuteMsg, GetProtocolsResponse, GetRebalanceHistoryResponse, InstantiateMsg, QueryMsg,
+    RiskParametersMsg,
+};
 use crate::tests::common::*;
 use crate::tests::protocol_tests::setup_test_protocols;
 
@@ -142,18 +145,17 @@ fn test_rebalance_invalid_allocations() {
 }
 
 #[test]
-fn test_rebalance_max_allocation_exceeded() {
+fn test_rebalance_invalid_total_allocation() {
     let (mut deps, _admin, operator) = setup_rebalance_test();
 
-    // Try to execute rebalance with an allocation exceeding the max allowed (50%)
+    // Try to execute rebalance with allocations that don't sum to 100%
+    // 101% exceeds the valid total allocation
     let info = message_info(&operator, &[]);
     let msg = ExecuteMsg::Rebalance {
         target_allocations: vec![
-            ("helix".to_string(), Decimal::percent(60)),
-            ("hydro".to_string(), Decimal::percent(20)),
-            ("neptune".to_string(), Decimal::percent(20)),
+            ("helix".to_string(), Decimal::percent(101)), // Exceeds max 100%
         ],
-        reason: "Max allocation exceeded".to_string(),
+        reason: "Invalid total allocation".to_string(),
     };
 
     let res = execute(deps.as_mut(), mock_env(), info, msg);
@@ -162,7 +164,66 @@ fn test_rebalance_max_allocation_exceeded() {
     assert!(res.is_err());
     match res {
         Err(e) => {
-            assert!(format!("{:?}", e).contains("ExcessiveAllocation"));
+            let error_msg = format!("{:?}", e);
+            println!("Actual error: {}", error_msg);
+            assert!(error_msg.contains("InvalidAllocations"));
+        }
+        _ => panic!("Expected an error"),
+    }
+}
+
+#[test]
+fn test_rebalance_excessive_allocation() {
+    // First update the risk parameters to have a lower max allocation per protocol
+    let mut deps = mock_dependencies();
+    mock_protocol_response(&mut deps);
+
+    // Setup with custom max allocation per protocol (40%)
+    let msg = InstantiateMsg {
+        admin: admin_address(),
+        ai_operator: operator_address(),
+        base_denom: DENOM.to_string(),
+        accepted_denoms: vec![DENOM.to_string(), "inj".to_string()],
+        astroport_router: router_address(),
+        risk_parameters: RiskParametersMsg {
+            max_allocation_per_protocol: Decimal::percent(40),
+            max_slippage: Decimal::percent(1),
+            rebalance_threshold: Decimal::percent(5),
+            emergency_withdrawal_fee: Decimal::percent(1),
+        },
+    };
+
+    let info = message_info(&Addr::unchecked(creator_address()), &[]);
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+    setup_test_protocols(&mut deps);
+
+    // Add funds
+    let deposit_amount = 1000u128;
+    let user = Addr::unchecked(user_address());
+    let info = message_info(&user, &coins(deposit_amount, DENOM));
+    execute(deps.as_mut(), mock_env(), info, ExecuteMsg::Deposit {}).unwrap();
+
+    // Try to execute rebalance with one protocol exceeding max allocation
+    let operator = Addr::unchecked(operator_address());
+    let info = message_info(&operator, &[]);
+    let msg = ExecuteMsg::Rebalance {
+        target_allocations: vec![
+            ("helix".to_string(), Decimal::percent(50)), // Exceeds max 40%
+            ("hydro".to_string(), Decimal::percent(25)),
+            ("neptune".to_string(), Decimal::percent(25)),
+        ],
+        reason: "Allocation exceeding max per protocol".to_string(),
+    };
+
+    let res = execute(deps.as_mut(), mock_env(), info, msg);
+
+    // Should return an error
+    assert!(res.is_err());
+    match res {
+        Err(e) => {
+            let error_msg = format!("{:?}", e);
+            println!("Actual error: {}", error_msg);
+            assert!(error_msg.contains("ExcessiveAllocation"));
         }
         _ => panic!("Expected an error"),
     }
