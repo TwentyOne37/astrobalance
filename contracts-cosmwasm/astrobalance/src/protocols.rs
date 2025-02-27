@@ -246,7 +246,7 @@ impl YieldProtocol for NeptuneAdapter {
 }
 
 // Protocol interfaces - these would be imported from respective crates in production
-mod helix {
+pub mod helix {
     use cosmwasm_schema::cw_serde;
     use cosmwasm_std::{Decimal, Uint128};
 
@@ -273,7 +273,7 @@ mod helix {
     }
 }
 
-mod hydro {
+pub mod hydro {
     use cosmwasm_schema::cw_serde;
     use cosmwasm_std::{Decimal, Uint128};
 
@@ -300,7 +300,7 @@ mod hydro {
     }
 }
 
-mod neptune {
+pub mod neptune {
     use cosmwasm_schema::cw_serde;
     use cosmwasm_std::{Decimal, Uint128};
 
