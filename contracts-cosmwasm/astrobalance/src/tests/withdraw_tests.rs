@@ -80,8 +80,14 @@ fn test_withdraw_insufficient_funds() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "Token conversion via Astroport router is difficult to mock correctly"]
 fn test_withdraw_with_specific_denom() {
+    // This test is ignored because mocking the Astroport router for token conversion
+    // (from USDC to INJ) is complex and requires detailed parsing of Binary messages.
+    // In a real environment, the router would handle this conversion properly.
+    // For local testing, we would need a more sophisticated mock that can parse
+    // the exact binary format of the router requests/responses.
+
     let mut deps = mock_dependencies();
     mock_protocol_response(&mut deps);
     setup_contract(deps.as_mut());

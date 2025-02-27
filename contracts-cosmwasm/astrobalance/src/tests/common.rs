@@ -142,14 +142,60 @@ pub fn mock_protocol_response(deps: &mut OwnedDeps<MockStorage, MockApi, MockQue
                     };
                     SystemResult::Ok(ContractResult::Ok(to_json_binary(&mock_response).unwrap()))
                 }
-                // Mock Astroport router responses
+                // Mock Astroport router responses for SimulateSwapOperations
                 else if contract_addr.contains("router")
                     && msg_str.contains("SimulateSwapOperations")
                 {
-                    let mock_response = SimulateSwapResponse {
-                        amount: Uint128::from(98u128), // 2% price impact
-                    };
-                    SystemResult::Ok(ContractResult::Ok(to_json_binary(&mock_response).unwrap()))
+                    // Check if it's a conversion to or from USDC
+                    if msg_str.contains("inj") && msg_str.contains("usdc") {
+                        // This simulates converting INJ to USDC or USDC to INJ
+                        // For tests, we'll use a simple 1:10 ratio (1 INJ = 10 USDC)
+                        let sim_response = if msg_str.contains(r#""denom":"inj""#)
+                            && msg_str.contains(r#""denom":"usdc""#)
+                        {
+                            // INJ to USDC (multiply by 10)
+                            let amount_str = msg_str
+                                .split("offer_amount\":")
+                                .nth(1)
+                                .unwrap_or("0")
+                                .split(",")
+                                .next()
+                                .unwrap_or("0");
+                            let amount = amount_str.trim().parse::<u128>().unwrap_or(0);
+                            SimulateSwapResponse {
+                                amount: Uint128::from(amount * 10),
+                            }
+                        } else {
+                            // USDC to INJ (divide by 10)
+                            let amount_str = msg_str
+                                .split("offer_amount\":")
+                                .nth(1)
+                                .unwrap_or("0")
+                                .split(",")
+                                .next()
+                                .unwrap_or("0");
+                            let amount = amount_str.trim().parse::<u128>().unwrap_or(0);
+                            SimulateSwapResponse {
+                                amount: Uint128::from(amount / 10),
+                            }
+                        };
+                        SystemResult::Ok(ContractResult::Ok(to_json_binary(&sim_response).unwrap()))
+                    } else {
+                        // For any other token conversion
+                        let mock_response = SimulateSwapResponse {
+                            amount: Uint128::from(98u128), // 2% price impact
+                        };
+                        SystemResult::Ok(ContractResult::Ok(
+                            to_json_binary(&mock_response).unwrap(),
+                        ))
+                    }
+                }
+                // Mock ExecuteSwapOperations (needed for actual swap execution)
+                else if contract_addr.contains("router")
+                    && msg_str.contains("ExecuteSwapOperations")
+                {
+                    // Just return an empty response as this is an execute message
+                    SystemResult::Ok(ContractResult::Ok(to_json_binary(&"").unwrap()))
                 } else {
                     // Fix: Wrap error in correct type
                     SystemResult::Err(SystemError::InvalidRequest {
