@@ -1020,7 +1020,9 @@ fn query_rebalance_history(
     let history = REBALANCE_HISTORY.load(deps.storage)?;
     let limit_val = limit.unwrap_or(history.len() as u32) as usize;
 
-    let limited_history: Vec<RebalanceRecord> = history.iter().take(limit_val).cloned().collect();
+    // Reverse the history to return newest first
+    let limited_history: Vec<RebalanceRecord> =
+        history.iter().rev().take(limit_val).cloned().collect();
 
     Ok(GetRebalanceHistoryResponse {
         history: limited_history,
