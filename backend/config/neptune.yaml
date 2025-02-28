@@ -1,0 +1,18 @@
+# Neptune protocol configuration
+name: Neptune Finance
+api_url: https://neptune.injective.network/api
+enable_direct_queries: true
+pools:
+  - id: neptune_usdc_atom
+    name: USDC-ATOM Yield Pool
+    base_apy: 24.8
+    base_tvl: 1250000
+    pairs: [USDC, ATOM]
+    risk_profile: moderate
+
+  - id: neptune_usdc_inj
+    name: USDC-INJ Yield Pool
+    base_apy: 29.2
+    base_tvl: 1650000
+    pairs: [USDC, INJ]
+    risk_profile: moderate

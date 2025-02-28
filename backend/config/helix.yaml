@@ -1,0 +1,25 @@
+# Helix protocol configuration
+name: Helix Finance
+api_url: https://helix.injective.network/api
+enable_direct_queries: true
+pools:
+  - id: helix_usdc_inj
+    name: USDC-INJ LP
+    base_apy: 28.5
+    base_tvl: 1850000
+    pairs: [USDC, INJ]
+    risk_profile: moderate
+
+  - id: helix_usdc_atom
+    name: USDC-ATOM LP
+    base_apy: 22.3
+    base_tvl: 920000
+    pairs: [USDC, ATOM]
+    risk_profile: moderate
+
+  - id: helix_usdc_usdt
+    name: USDC-USDT LP
+    base_apy: 12.8
+    base_tvl: 4300000
+    pairs: [USDC, USDT]
+    risk_profile: low

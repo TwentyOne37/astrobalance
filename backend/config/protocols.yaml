@@ -1,0 +1,22 @@
+# Global protocol configuration
+protocols:
+  - id: helix
+    name: Helix
+    enabled: true
+    api_url: https://helix.injective.network/api
+
+  - id: hydro
+    name: Hydro
+    enabled: true
+    api_url: https://hydro.injective.network/api
+
+  - id: neptune
+    name: Neptune
+    enabled: true
+    api_url: https://neptune.injective.network/api
+
+# Global AstroBalance configuration
+default_risk_profile: moderate
+rebalance_threshold: 15 # Minimum percentage difference to trigger rebalance
+min_apy_improvement: 1.0 # Minimum APY improvement to trigger rebalance
+max_protocols: 3 # Maximum number of protocols to allocate to

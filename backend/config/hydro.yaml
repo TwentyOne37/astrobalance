@@ -1,0 +1,25 @@
+# Hydro protocol configuration
+name: Hydro Protocol
+api_url: https://hydro.injective.network/api
+enable_direct_queries: true
+pools:
+  - id: hydro_usdc_usdt
+    name: USDC-USDT Stable Pool
+    base_apy: 8.2
+    base_tvl: 5600000
+    pairs: [USDC, USDT]
+    risk_profile: low
+
+  - id: hydro_usdc_dai
+    name: USDC-DAI Stable Pool
+    base_apy: 7.9
+    base_tvl: 2900000
+    pairs: [USDC, DAI]
+    risk_profile: low
+
+  - id: hydro_inj_atom
+    name: INJ-ATOM Trading Pool
+    base_apy: 32.5
+    base_tvl: 840000
+    pairs: [INJ, ATOM]
+    risk_profile: high
